@@ -8,6 +8,21 @@ import type { TemplateContext } from "./template-context";
 import { escapeControlCharacters, isPrimitiveType, wrapWithQuotesIfNeeded } from "./utils";
 import { inferRequiredSchema } from "./inferRequiredOnly";
 
+// Extended SchemaObject type to include x-validation-messages
+type ExtendedSchemaObject = SchemaObject & {
+    "x-validation-messages"?: Record<string, string>;
+};
+
+// Helper to get custom validation message
+const getValidationMessage = (schema: ExtendedSchemaObject, key: string): string | undefined => {
+    return schema["x-validation-messages"]?.[key];
+};
+
+// Helper to format message for Zod (escape quotes and handle special chars)
+const formatMessageForZod = (message: string): string => {
+    return message.replace(/"/g, '\\"');
+};
+
 type ConversionArgs = {
     schema: SchemaObject | ReferenceObject;
     ctx?: ConversionTypeContext | undefined;
@@ -28,6 +43,7 @@ export function getZodSchema({ schema: $schema, ctx, meta: inheritedMeta, option
     const schema = options?.schemaRefiner?.($schema, inheritedMeta) ?? $schema;
     const code = new CodeMeta(schema, ctx, inheritedMeta);
     const meta = {
+        ...inheritedMeta,
         parent: code.inherit(inheritedMeta?.parent),
         referencedBy: [...code.meta.referencedBy],
     };
@@ -196,16 +212,21 @@ export function getZodSchema({ schema: $schema, ctx, meta: inheritedMeta, option
             );
         }
 
-        return code.assign(
-            match(schemaType)
-                .with("integer", () => "z.number()")
-                .with("string", () =>
-                    match(schema.format)
-                        .with("binary", () => "z.instanceof(File)")
-                        .otherwise(() => "z.string()")
-                )
-                .otherwise((type) => `z.${type}()`)
-        );
+        const extSchema = schema as ExtendedSchemaObject;
+        const requiredMessage = meta?.isRequired ? getValidationMessage(extSchema, "required") : undefined;
+        
+        const baseType = match(schemaType)
+            .with("integer", () => requiredMessage ? `z.number({ required_error: "${formatMessageForZod(requiredMessage)}" })` : "z.number()")
+            .with("string", () =>
+                match(schema.format)
+                    .with("binary", () => "z.instanceof(File)")
+                    .otherwise(() => requiredMessage ? `z.string({ required_error: "${formatMessageForZod(requiredMessage)}" })` : "z.string()")
+            )
+            .with("boolean", () => requiredMessage ? `z.boolean({ required_error: "${formatMessageForZod(requiredMessage)}" })` : "z.boolean()")
+            .otherwise((type) => requiredMessage ? `z.${type}({ required_error: "${formatMessageForZod(requiredMessage)}" })` : `z.${type}()`);
+
+        const chain = getZodChain({ schema, meta, options });
+        return code.assign(`${baseType}${chain}`);
     }
 
     const readonly = options?.allReadonly ? ".readonly()" : "";
@@ -214,13 +235,7 @@ export function getZodSchema({ schema: $schema, ctx, meta: inheritedMeta, option
         if (schema.items) {
             return code.assign(
                 `z.array(${
-                    getZodSchema({ schema: schema.items, ctx, meta, options }).toString()
-                }${
-                    getZodChain({
-                        schema: schema.items as SchemaObject,
-                        meta: { ...meta, isRequired: true },
-                        options,
-                    })
+                    getZodSchema({ schema: schema.items, ctx, meta: { ...meta, isRequired: true }, options }).toString()
                 })${readonly}`
             );
         }
@@ -240,14 +255,12 @@ export function getZodSchema({ schema: $schema, ctx, meta: inheritedMeta, option
 
         if (typeof schema.additionalProperties === "object" && Object.keys(schema.additionalProperties).length > 0) {
             return code.assign(
-                `z.record(${(
-                    getZodSchema({ schema: schema.additionalProperties, ctx, meta, options }) +
-                    getZodChain({
-                        schema: schema.additionalProperties as SchemaObject,
-                        meta: { ...meta, isRequired: true },
-                        options,
-                    })
-                ).toString()})`
+                `z.record(${getZodSchema({
+                    schema: schema.additionalProperties,
+                    ctx,
+                    meta: { ...meta, isRequired: true },
+                    options
+                }).toString()})`
             );
         }
 
@@ -276,9 +289,7 @@ export function getZodSchema({ schema: $schema, ctx, meta: inheritedMeta, option
                     }
                 }
 
-                const propCode =
-                    getZodSchema({ schema: propSchema, ctx, meta: propMetadata, options }) +
-                    getZodChain({ schema: propActualSchema as SchemaObject, meta: propMetadata, options });
+                const propCode = getZodSchema({ schema: propSchema, ctx, meta: propMetadata, options });
 
                 return [prop, propCode.toString()];
             });
@@ -304,6 +315,7 @@ type ZodChainArgs = { schema: SchemaObject; meta?: CodeMetaData; options?: Templ
 
 export const getZodChain = ({ schema, meta, options }: ZodChainArgs) => {
     const chains: string[] = [];
+    const extSchema = schema as ExtendedSchemaObject;
 
     match(schema.type)
         .with("string", () => chains.push(getZodChainableStringValidations(schema)))
@@ -311,11 +323,30 @@ export const getZodChain = ({ schema, meta, options }: ZodChainArgs) => {
         .with("array", () => chains.push(getZodChainableArrayValidations(schema)))
         .otherwise(() => void 0);
 
-    if (typeof schema.description === "string" && schema.description !== "" && options?.withDescription) {
-        if (["\n", "\r", "\r\n"].some((c) => String.prototype.includes.call(schema.description, c))) {
-            chains.push(`describe(\`${schema.description}\`)`);
+    // Build description with backend-specific validation notes
+    let description = schema.description || "";
+    const backendValidations: string[] = [];
+    // Backend-only validations that can't be checked on frontend
+    const backendRules = ["exists", "unique", "same", "confirmed", "in"];
+    
+    if (extSchema["x-validation-messages"]) {
+        for (const [rule, message] of Object.entries(extSchema["x-validation-messages"])) {
+            if (backendRules.includes(rule)) {
+                backendValidations.push(`${message}`);
+            }
+        }
+    }
+    
+    if (backendValidations.length > 0 && options?.withDescription) {
+        const backendNote = "\n\n⚠️ Backend validations: " + backendValidations.join("; ");
+        description = description ? description + backendNote : backendNote.trim();
+    }
+
+    if (typeof description === "string" && description !== "" && options?.withDescription) {
+        if (["\n", "\r", "\r\n"].some((c) => String.prototype.includes.call(description, c))) {
+            chains.push(`describe(\`${description}\`)`);
         } else {
-            chains.push(`describe("${schema.description}")`);
+            chains.push(`describe("${description}")`);
         }
     }
 
@@ -376,29 +407,39 @@ const formatPatternIfNeeded = (pattern: string) => {
 };
 
 const getZodChainableStringValidations = (schema: SchemaObject) => {
+    const extSchema = schema as ExtendedSchemaObject;
     const validations: string[] = [];
 
     if (!schema.enum) {
         if (schema.minLength !== undefined) {
-            validations.push(`min(${schema.minLength})`);
+            const message = getValidationMessage(extSchema, "min");
+            validations.push(message ? `min(${schema.minLength}, "${formatMessageForZod(message)}")` : `min(${schema.minLength})`);
         }
 
         if (schema.maxLength !== undefined) {
-            validations.push(`max(${schema.maxLength})`);
+            const message = getValidationMessage(extSchema, "max");
+            validations.push(message ? `max(${schema.maxLength}, "${formatMessageForZod(message)}")` : `max(${schema.maxLength})`);
         }
     }
 
     if (schema.pattern) {
-        validations.push(`regex(${formatPatternIfNeeded(schema.pattern)})`);
+        const message = getValidationMessage(extSchema, "regex");
+        validations.push(
+            message 
+                ? `regex(${formatPatternIfNeeded(schema.pattern)}, "${formatMessageForZod(message)}")`
+                : `regex(${formatPatternIfNeeded(schema.pattern)})`
+        );
     }
 
     if (schema.format) {
-        const chain = match(schema.format)
-            .with("email", () => "email()")
-            .with("hostname", () => "url()")
-            .with("uri", () => "url()")
-            .with("uuid", () => "uuid()")
-            .with("date-time", () => "datetime({ offset: true })")
+        const formatType = schema.format;
+        const message = getValidationMessage(extSchema, formatType);
+        const chain = match(formatType)
+            .with("email", () => message ? `email("${formatMessageForZod(message)}")` : "email()")
+            .with("hostname", () => message ? `url("${formatMessageForZod(message)}")` : "url()")
+            .with("uri", () => message ? `url("${formatMessageForZod(message)}")` : "url()")
+            .with("uuid", () => message ? `uuid("${formatMessageForZod(message)}")` : "uuid()")
+            .with("date-time", () => message ? `datetime({ offset: true, message: "${formatMessageForZod(message)}" })` : "datetime({ offset: true })")
             .otherwise(() => "");
 
         if (chain) {
@@ -410,6 +451,7 @@ const getZodChainableStringValidations = (schema: SchemaObject) => {
 };
 
 const getZodChainableNumberValidations = (schema: SchemaObject) => {
+    const extSchema = schema as ExtendedSchemaObject;
     const validations: string[] = [];
 
     // none of the chains are valid for enums
@@ -418,45 +460,56 @@ const getZodChainableNumberValidations = (schema: SchemaObject) => {
     }
 
     if (schema.type === "integer") {
-        validations.push("int()");
+        const message = getValidationMessage(extSchema, "int");
+        validations.push(message ? `int("${formatMessageForZod(message)}")` : "int()");
     }
 
     if (schema.minimum !== undefined) {
+        const message = getValidationMessage(extSchema, "min") || getValidationMessage(extSchema, "gte");
         if (schema.exclusiveMinimum === true) {
-            validations.push(`gt(${schema.minimum})`);
+            const gtMessage = getValidationMessage(extSchema, "gt");
+            validations.push(gtMessage ? `gt(${schema.minimum}, "${formatMessageForZod(gtMessage)}")` : `gt(${schema.minimum})`);
         } else {
-            validations.push(`gte(${schema.minimum})`);
+            validations.push(message ? `gte(${schema.minimum}, "${formatMessageForZod(message)}")` : `gte(${schema.minimum})`);
         }
     } else if (typeof schema.exclusiveMinimum === "number") {
-        validations.push(`gt(${schema.exclusiveMinimum})`);
+        const message = getValidationMessage(extSchema, "gt");
+        validations.push(message ? `gt(${schema.exclusiveMinimum}, "${formatMessageForZod(message)}")` : `gt(${schema.exclusiveMinimum})`);
     }
 
     if (schema.maximum !== undefined) {
+        const message = getValidationMessage(extSchema, "max") || getValidationMessage(extSchema, "lte");
         if (schema.exclusiveMaximum === true) {
-            validations.push(`lt(${schema.maximum})`);
+            const ltMessage = getValidationMessage(extSchema, "lt");
+            validations.push(ltMessage ? `lt(${schema.maximum}, "${formatMessageForZod(ltMessage)}")` : `lt(${schema.maximum})`);
         } else {
-            validations.push(`lte(${schema.maximum})`);
+            validations.push(message ? `lte(${schema.maximum}, "${formatMessageForZod(message)}")` : `lte(${schema.maximum})`);
         }
     } else if (typeof schema.exclusiveMaximum === "number") {
-        validations.push(`lt(${schema.exclusiveMaximum})`);
+        const message = getValidationMessage(extSchema, "lt");
+        validations.push(message ? `lt(${schema.exclusiveMaximum}, "${formatMessageForZod(message)}")` : `lt(${schema.exclusiveMaximum})`);
     }
 
     if (schema.multipleOf) {
-        validations.push(`multipleOf(${schema.multipleOf})`);
+        const message = getValidationMessage(extSchema, "multipleOf");
+        validations.push(message ? `multipleOf(${schema.multipleOf}, "${formatMessageForZod(message)}")` : `multipleOf(${schema.multipleOf})`);
     }
 
     return validations.join(".");
 };
 
 const getZodChainableArrayValidations = (schema: SchemaObject) => {
+    const extSchema = schema as ExtendedSchemaObject;
     const validations: string[] = [];
 
     if (schema.minItems) {
-        validations.push(`min(${schema.minItems})`);
+        const message = getValidationMessage(extSchema, "min");
+        validations.push(message ? `min(${schema.minItems}, "${formatMessageForZod(message)}")` : `min(${schema.minItems})`);
     }
 
     if (schema.maxItems) {
-        validations.push(`max(${schema.maxItems})`);
+        const message = getValidationMessage(extSchema, "max");
+        validations.push(message ? `max(${schema.maxItems}, "${formatMessageForZod(message)}")` : `max(${schema.maxItems})`);
     }
 
     return validations.join(".");
