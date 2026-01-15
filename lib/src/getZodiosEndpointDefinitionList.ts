@@ -275,13 +275,7 @@ export const getZodiosEndpointDefinitionList = (doc: OpenAPIObject, options?: Te
                             .with("query", () => "Query")
                             .with("path", () => "Path")
                             .run() as "Header" | "Query" | "Path",
-                        schema: getZodVarName(
-                            paramCode.assign(
-                                paramCode.toString() +
-                                    getZodChain({ schema: paramSchema, meta: paramCode.meta, options })
-                            ),
-                            paramItem.name
-                        ),
+                        schema: getZodVarName(paramCode, paramItem.name),
                     });
                 }
             }
