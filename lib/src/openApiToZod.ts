@@ -409,8 +409,11 @@ const formatPatternIfNeeded = (pattern: string) => {
 const getZodChainableStringValidations = (schema: SchemaObject) => {
     const extSchema = schema as ExtendedSchemaObject;
     const validations: string[] = [];
+    
+    // Skip min/max validations for binary files (File type)
+    const isBinaryFile = schema.format === "binary";
 
-    if (!schema.enum) {
+    if (!schema.enum && !isBinaryFile) {
         if (schema.minLength !== undefined) {
             const message = getValidationMessage(extSchema, "min");
             validations.push(message ? `min(${schema.minLength}, "${formatMessageForZod(message)}")` : `min(${schema.minLength})`);
